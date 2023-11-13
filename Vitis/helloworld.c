@@ -1,202 +1,137 @@
-/******************************************************************************
-*
-* Copyright (C) 2009 - 2014 Xilinx, Inc.  All rights reserved.
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* Use of the Software is limited solely to applications:
-* (a) running on a Xilinx device, or
-* (b) that interact with a Xilinx device through a bus or interconnect.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-* XILINX  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
-* OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-* SOFTWARE.
-*
-* Except as contained in this notice, the name of the Xilinx shall not be used
-* in advertising or otherwise to promote the sale, use or other dealings in
-* this Software without prior written authorization from Xilinx.
-*
-******************************************************************************/
-
-/*
- * helloworld.c: simple test application
- *
- * This application configures UART 16550 to baud rate 9600.
- * PS7 UART (Zynq) is not initialized by this application, since
- * bootrom/bsp configures it to baud rate 115200
- *
- * ------------------------------------------------
- * | UART TYPE   BAUD RATE                        |
- * ------------------------------------------------
- *   uartns550   9600
- *   uartlite    Configurable only in HW design
- *   ps7_uart    115200 (configured by bootrom/bsp)
- */
-
-#include <stdio.h>
 #include "platform.h"
 #include "xaxidma.h"
 #include "xparameters.h"
 #include "xparameters_ps.h"
-#include "sleep.h"
 #include "xil_cache.h"
 #include "xil_printf.h"
 #include "xgpio.h"
 #include "xscugic.h"
+#include <assert.h>
 
-//#include <stdio.h>
-//#include "platform.h"
-//#include "xil_printf.h"
+#define printf xil_printf
+#define assert_printf(v1, op, v2, optional_debug_info,...) ((v1  op v2) || (printf("ASSERT FAILED: \n CONDITION: "), printf("( " #v1 " " #op " " #v2 " )"), printf(", VALUES: ( %ld %s %ld ), ", (long int)v1, #op, (long int)v2), printf("DEBUG_INFO: " optional_debug_info), printf(" " __VA_ARGS__), printf("\n\n"), assert(v1 op v2), 0))
 
 static int glb_s2mm_done = 0;
 static int glb_mm2s_done = 0;
-static int glb_rtl_irq = 0;
-//XAxiDma myDma;
-XScuGic IntcInst;
+static int glb_rtl_irq   = 0;
 
-static void s2mm_isr(void* CallbackRef);
-static void mm2s_isr(void* CallbackRef);
-static void rtl_isr(void* CallbackRef);
+XAxiDma my_dma;
+XScuGic intr_controller; // Generic interrupt controller
+XGpio   gpio_out;
+u32     status;
 
-int main()
-{
-    init_platform();
-    print("Hello World\n\r");
-
-    const int LEN = 10;
-    u32 a[LEN];
-    u32 b[LEN];
-    u32 status;
-
-    for (u32 i = 0; i<LEN; i ++){
-    	a[i] = i+10;
-    }
-
-    xil_printf("Hello dma!\n");
-
-    // Step 1: init DMA, without interrupt
-    XAxiDma_Config *myDmaConfig;	// a struct with config data, intersection with dma struct
-    XAxiDma myDma;		// a struct with DMA instance data variables, & hardware type
-
-    myDmaConfig = XAxiDma_LookupConfigBaseAddr(XPAR_AXI_DMA_0_BASEADDR);	// takes in base addr, return a pointer to config, only 1 dma in this application!
-    status = XAxiDma_CfgInitialize(&myDma, myDmaConfig);
-
-    if(status != XST_SUCCESS){
-    	xil_printf("DMA initialization failed\n");
-    	return -1;
-    }
-   	xil_printf("DMA initialization success..\n");
-
-   	// Step 2: init dma intr controller
-	XScuGic_Config *IntcConfig;
-
-	IntcConfig =  XScuGic_LookupConfig(XPAR_SCUGIC_SINGLE_DEVICE_ID);
-	if (NULL == IntcConfig) {
-		return XST_FAILURE;
-	}
-	status = XScuGic_CfgInitialize(&IntcInst, IntcConfig, IntcConfig->CpuBaseAddress);
-	if (status != XST_SUCCESS) {
-			return XST_FAILURE;
-	}
-	// set trigger priority: dma send and rcv
-	XScuGic_SetPriorityTriggerType(&IntcInst, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR, 0xA0, 0x3);	// priority level, triggered by edge
-	XScuGic_SetPriorityTriggerType(&IntcInst, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR, 0xA8, 0x3);
-	XScuGic_SetPriorityTriggerType(&IntcInst, XPS_FPGA2_INT_ID, 0xAB, 0x03);
-
-	status = XScuGic_Connect(&IntcInst, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR, (Xil_InterruptHandler)s2mm_isr, 0);
-	if (status != XST_SUCCESS){
-		xil_printf("ERROR! Failed to connect s2mm_isr to the interrupt controller.\r\n", status);
-		return -1;
-	}
-	status = XScuGic_Connect(&IntcInst, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR, (Xil_InterruptHandler)mm2s_isr, 0);
-	if (status != XST_SUCCESS){
-		xil_printf("ERROR! Failed to connect mm2s_isr to the interrupt controller.\r\n", status);
-		return -1;
-	}
-	status = XScuGic_Connect(&IntcInst, XPS_FPGA2_INT_ID, (Xil_InterruptHandler)rtl_isr, 0);
-	if (status != XST_SUCCESS){
-		xil_printf("ERROR! Failed to connect mm2s_isr to the interrupt controller.\r\n", status);
-		return -1;
-	}
-
-	XScuGic_Enable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR);
-	XScuGic_Enable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR);
-	XScuGic_Enable(&IntcInst, XPS_FPGA2_INT_ID);
-
-	// Initialize exception table and register the interrupt controller handler with exception table
-	Xil_ExceptionInit();
-	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT, (Xil_ExceptionHandler)XScuGic_InterruptHandler, (void *)&IntcInst);
-
-	// Enable non-critical exceptions
-	Xil_ExceptionEnable();
-
-	//XAxiDma_IntrDisable(&myDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
-	XAxiDma_IntrEnable(&myDma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DEVICE_TO_DMA);
-
-	//XAxiDma_IntrDisable(&myDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
-	XAxiDma_IntrEnable(&myDma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DMA_TO_DEVICE);
-
-   	// Step 3: flush data and record the transaction.
-   	Xil_DCacheFlushRange((u32)a, LEN*sizeof(u32));	// force transfer to ddr, starting addr & length
-
-   	status = XAxiDma_SimpleTransfer(&myDma, (u32)b, LEN*sizeof(u32),XAXIDMA_DEVICE_TO_DMA);	// initialize rcv first
-   	status = XAxiDma_SimpleTransfer(&myDma, (u32)a, LEN*sizeof(u32),XAXIDMA_DMA_TO_DEVICE);   //typecasting in C/C++
-   	// simple tranfer is non_blocking, just configure the dma registers and return!
-   	if(status != XST_SUCCESS){
-   		print("DMA transfer initialization failed\n");
-   		return -1;
-   	}
-   	//sleep(1);
-
-   	while (!glb_mm2s_done | !glb_s2mm_done);
-
-   	XGpio irq2rtl;
-   	XGpio_Initialize(&irq2rtl, XPAR_AXI_GPIO_0_DEVICE_ID);
-   	XGpio_SetDataDirection(&irq2rtl, 1, 0x0);
-   	XGpio_DiscreteWrite(&irq2rtl, 1, 0xFFFFFFFF);
-
-   	while (!glb_rtl_irq);
-
-   	for (u32 i = 0; i<LEN; i ++){
-   	    xil_printf("%0x\n", b[i]);
-   	}
-   	//sleep(1);
-
-    cleanup_platform();
-    return 0;
-}
+#define TRANSFER_LEN 10
+#define TRANSFER_BYTES (TRANSFER_LEN*sizeof(u32))
+u32 *a = (u32 *)XPAR_DDR_MEM_BASEADDR;
+u32 *b = (u32 *)XPAR_DDR_MEM_BASEADDR + 100;
 
 static void s2mm_isr(void* CallbackRef){
-	XScuGic_Disable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR);
-	xil_printf("s2mm finished!\n");
-	glb_s2mm_done = 1;
-	XScuGic_Enable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR);
+  u32 IrqStatus = XAxiDma_IntrGetIrq(&my_dma, XAXIDMA_DEVICE_TO_DMA);
+  XAxiDma_IntrAckIrq(&my_dma, IrqStatus, XAXIDMA_DEVICE_TO_DMA);
+  if (!(IrqStatus & XAXIDMA_IRQ_IOC_MASK)) return;
+  xil_printf("s2mm finished!\n");
+  glb_s2mm_done = 1;
 }
 
 static void mm2s_isr(void* CallbackRef){
-	XScuGic_Disable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR);
-	xil_printf("mm2s finished!\n");
-	glb_mm2s_done = 1;
-	XScuGic_Enable(&IntcInst, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR);
-	//XAxiDma_IntrEnable(p_dma_inst, (XAXIDMA_IRQ_IOC_MASK | XAXIDMA_IRQ_ERROR_MASK), XAXIDMA_DEVICE_TO_DMA);
+  u32 IrqStatus = XAxiDma_IntrGetIrq(&my_dma, XAXIDMA_DMA_TO_DEVICE); // Read pending interrupts
+  XAxiDma_IntrAckIrq(&my_dma, IrqStatus, XAXIDMA_DMA_TO_DEVICE); // Acknowledge pending interrupts
+  if (!(IrqStatus & XAXIDMA_IRQ_IOC_MASK)) return;
+  xil_printf("mm2s finished!\n");
+  glb_mm2s_done = 1;
 }
 
 static void rtl_isr(void* CallbackRef){
-	XScuGic_Disable(&IntcInst, XPS_FPGA2_INT_ID);
-	xil_printf("Bang!\n");
-	glb_rtl_irq = 1;
-	XScuGic_Enable(&IntcInst, XPS_FPGA2_INT_ID);
+  XScuGic_Disable(&intr_controller, XPS_FPGA2_INT_ID);
+  xil_printf("RTL raised interrupt!\n");
+  glb_rtl_irq = 1;
+  XScuGic_Enable(&intr_controller, XPS_FPGA2_INT_ID);
+}
+
+static void setup_interrupt(XScuGic *p_intr_controller, u32 intr_id, Xil_InterruptHandler handler_fn, u8 priority){
+  XScuGic_SetPriorityTriggerType(p_intr_controller, intr_id, priority, 0x3);            // set priority level, triggered by rising edge
+  status = XScuGic_Connect(p_intr_controller, intr_id, handler_fn, 0);    // connect interrupt handler
+  assert_printf (status, ==, XST_SUCCESS, "ERROR! Failed to connect mm2s_isr to the interrupt controller.\r\n",);
+  XScuGic_Enable(p_intr_controller, intr_id); // enable interrupt
+}
+
+
+int main() {
+  init_platform();
+  print("Hello World -- Aba\n\r");
+
+  // Initialize Interrupt Controller
+  XScuGic_Config *IntcConfig =  XScuGic_LookupConfig(XPAR_SCUGIC_SINGLE_DEVICE_ID);
+  status = XScuGic_CfgInitialize(&intr_controller, IntcConfig, IntcConfig->CpuBaseAddress);
+  assert_printf (status, ==, XST_SUCCESS, "Interrupt initialization failed",);
+  Xil_ExceptionInit(); // Initialize exception table
+  Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT, (Xil_ExceptionHandler)XScuGic_InterruptHandler, (void *)&intr_controller);  //register the interrupt controller handler with exception table
+  Xil_ExceptionEnable(); // Enable non-critical exceptions
+
+
+  // Initialize DMA
+  status = XAxiDma_CfgInitialize(&my_dma, XAxiDma_LookupConfigBaseAddr(XPAR_AXI_DMA_0_BASEADDR));
+  assert_printf (status, ==, XST_SUCCESS, "DMA initialization failed",);
+  // MM2S
+  setup_interrupt(&intr_controller, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR, (Xil_InterruptHandler)mm2s_isr, 0xA0);
+  XAxiDma_IntrDisable(&my_dma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DMA_TO_DEVICE);
+  XAxiDma_IntrEnable (&my_dma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DMA_TO_DEVICE);
+  // S2MM
+  setup_interrupt(&intr_controller, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR, (Xil_InterruptHandler)s2mm_isr, 0xA8);
+  XAxiDma_IntrDisable(&my_dma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DEVICE_TO_DMA);
+  XAxiDma_IntrEnable (&my_dma, XAXIDMA_IRQ_IOC_MASK, XAXIDMA_DEVICE_TO_DMA);
+
+
+  // RTL Interrupt
+  setup_interrupt(&intr_controller, XPS_FPGA2_INT_ID, (Xil_InterruptHandler)rtl_isr , 0xAB);
+
+  // Initialize GPIO
+  XGpio_Initialize(&gpio_out, XPAR_AXI_GPIO_0_DEVICE_ID);
+  XGpio_SetDataDirection(&gpio_out, 1, 0x0);
+
+
+  // ------------ DATA TRANSFER ---------------
+
+  for (int t=0; t<100; t++){
+
+    // 1. Prepare input data
+    for (u32 i = 0; i<TRANSFER_LEN; i++){
+      a[i] = 10*t + i;
+      xil_printf("a[%d] = %d\n", i, a[i]);
+    }
+    Xil_DCacheFlushRange((INTPTR)a, TRANSFER_BYTES);  // force transfer to DDR, starting addr & length
+    Xil_DCacheFlushRange((INTPTR)b, TRANSFER_BYTES);
+
+    // 2. Start transfers
+    status = XAxiDma_SimpleTransfer(&my_dma, (INTPTR)b, TRANSFER_BYTES, XAXIDMA_DEVICE_TO_DMA);
+    status = XAxiDma_SimpleTransfer(&my_dma, (INTPTR)a, TRANSFER_BYTES, XAXIDMA_DMA_TO_DEVICE);
+
+    assert_printf (status, ==, XST_SUCCESS, "DMA transfer initialization failed \r\n",);
+
+    // 3. Wait for interrupt callbacks to set global variables
+    while (!glb_mm2s_done | !glb_s2mm_done);
+    glb_mm2s_done = 0;
+    glb_s2mm_done = 0;
+
+    // 4. Read data
+    Xil_DCacheFlushRange((INTPTR)b, TRANSFER_BYTES);
+    for (u32 i = 0; i<TRANSFER_LEN; i++) {
+      xil_printf("b[%d] = %d\n", i, b[i]);
+    }
+
+    // Write GPIO, wait for interrupt to clear the global variable
+    XGpio_DiscreteWrite(&gpio_out, 1, 0xFFFFFFFF);
+    while (!glb_rtl_irq);
+    glb_rtl_irq = 0;
+    XGpio_DiscreteWrite(&gpio_out, 1, 0);
+
+    xil_printf("Done transfer: %d/100 \n", t);
+  }
+
+  XScuGic_Disconnect(&intr_controller, XPAR_FABRIC_AXI_DMA_0_S2MM_INTROUT_INTR);
+  XScuGic_Disconnect(&intr_controller, XPAR_FABRIC_AXI_DMA_0_MM2S_INTROUT_INTR);
+
+  cleanup_platform();
+  return 0;
 }
 
